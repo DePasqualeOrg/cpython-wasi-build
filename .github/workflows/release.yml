@@ -77,6 +77,14 @@ jobs:
             repository: "python/cpython"
             ref: "v${{ inputs.python_major_minor }}.${{ inputs.python_micro }}"
             persist-credentials: false
+        - name: "Apply App Store compliance patch"
+          # Apple's automated App Review rejects any app whose bundle contains
+          # the string "itms-services", which ships in the unpatched stdlib's
+          # urllib/parse.py (python/cpython#120522). CPython carries the fix
+          # in-tree as the patch that `--with-app-store-compliance` applies on
+          # macOS/iOS builds; the WASI build doesn't honor that flag, so apply
+          # it directly.
+          run: patch -p1 < Mac/Resources/app-store-compliance.patch
         - name: "Install WASI SDK ${{ needs.get-wasi-sdk-version.outputs.wasi_sdk_version }}"
           id: install-wasi-sdk
           uses: bytecodealliance/setup-wasi-sdk-action@b2de090b44eb70013ee96b393727d473b35e1728
@@ -118,6 +126,15 @@ jobs:
           run: cp cross-build/${{ env.TARGET_TRIPLE }}/build/lib.*/_sysconfigdata_*.py ${ZIP_LIB_DIR}
         - name: "Copy LICENSE"
           run: cp LICENSE ${{ env.ZIP_DIR }}/
+        - name: "Verify App Store compliance"
+          # Belt and suspenders for the patch step above: fail the build if the
+          # prohibited string survives anywhere in the release contents
+          # (python.wasm or the stdlib), e.g. after a CPython upgrade moves it.
+          run: |
+            if grep --recursive --fixed-strings "itms-services" ${{ env.ZIP_DIR }}; then
+              echo "Found prohibited string 'itms-services' in release contents" >&2
+              exit 1
+            fi
         - name: "Create executable zip"
           run: |
             pushd ${{ env.ZIP_DIR }}

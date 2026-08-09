@@ -64,6 +64,7 @@ jobs:
           run: |
             sudo apt-get update
             sudo apt-get install build-essential pkg-config \
+            curl openssl unzip zip \
             libbz2-dev libffi-dev libgdbm-dev libgdbm-compat-dev \
             liblzma-dev libsqlite3-dev libssl-dev \
             lzma lzma-dev uuid-dev zlib1g-dev
@@ -77,6 +78,11 @@ jobs:
             repository: "python/cpython"
             ref: "v${{ inputs.python_major_minor }}.${{ inputs.python_micro }}"
             persist-credentials: false
+        - name: "Checkout the WASI build configuration"
+          uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+          with:
+            path: .build-config
+            persist-credentials: false
         - name: "Apply App Store compliance patch"
           # Apple's automated App Review rejects any app whose bundle contains
           # the string "itms-services", which ships in the unpatched stdlib's
@@ -87,14 +93,28 @@ jobs:
           run: patch -p1 < Mac/Resources/app-store-compliance.patch
         - name: "Install WASI SDK ${{ needs.get-wasi-sdk-version.outputs.wasi_sdk_version }}"
           id: install-wasi-sdk
-          uses: bytecodealliance/setup-wasi-sdk-action@b2de090b44eb70013ee96b393727d473b35e1728
+          uses: bytecodealliance/setup-wasi-sdk-action@b2de090b44eb70013ee96b393727d473b35e1728 # main at 2026-02-25
           with:
             version: ${{ needs.get-wasi-sdk-version.outputs.wasi_sdk_version }}
             add-to-path: false
         - name: "Install wasmtime"
           uses: bytecodealliance/actions/wasmtime/setup@6aecabac1eb1dcf7ed94ba9471974415ee2ebef2 # v1.1.2
+        - name: "Build WASI compression and SQLite dependencies"
+          run: .build-config/scripts/build-wasi-dependencies.sh
+          env:
+            WASI_SDK_PATH: ${{ steps.install-wasi-sdk.outputs.wasi-sdk-path }}
         - name: "Build"
-          run: python3 Tools/wasm/wasi build
+          run: |
+            if [[ -d Platforms/WASI ]]; then
+              wasi_builder=(python3 Platforms/WASI)
+            else
+              wasi_builder=(python3 Tools/wasm/wasi)
+            fi
+            "${wasi_builder[@]}" build-python
+            set -a
+            source .wasi-deps/dependency.env
+            set +a
+            "${wasi_builder[@]}" build-host
           env:
             WASI_SDK_PATH: ${{ steps.install-wasi-sdk.outputs.wasi-sdk-path }}
         - name: "Create lib directory"
@@ -113,6 +133,10 @@ jobs:
           run: |
             cp -r Lib/* ${ZIP_LIB_DIR}
             mkdir ${ZIP_LIB_DIR}/lib-dynload
+        - name: "Install verified universal wheels"
+          run: .build-config/scripts/install-python-packages.sh
+          env:
+            SITE_PACKAGES: ${{ env.ZIP_LIB_DIR }}/site-packages
         - name: "Strip stdlib"
           # Based on preexisting practice; could probably strip out more.
           run: |
@@ -120,12 +144,15 @@ jobs:
             rm -rf curses/ ctypes/test/ ensurepip/ distutils/ \
               lib2to3/ idlelib/ test/ multiprocessing/ \
               tkinter/ turtledemo/ venv/ unittest/test/
-            find -name __pycache__ | xargs rm -rf
+            find . -name __pycache__ -type d -prune -exec rm -rf {} +
             popd
         - name: "Copy over _sysconfigdata_*.py"
           run: cp cross-build/${{ env.TARGET_TRIPLE }}/build/lib.*/_sysconfigdata_*.py ${ZIP_LIB_DIR}
         - name: "Copy LICENSE"
-          run: cp LICENSE ${{ env.ZIP_DIR }}/
+          run: |
+            cp LICENSE ${{ env.ZIP_DIR }}/
+            cp .build-config/DEPENDENCIES.md ${{ env.ZIP_DIR }}/THIRD_PARTY_DEPENDENCIES.md
+            cp -r .wasi-deps/licenses ${{ env.ZIP_DIR }}/third-party-licenses
         - name: "Verify App Store compliance"
           # Belt and suspenders for the patch step above: fail the build if the
           # prohibited string survives anywhere in the release contents
@@ -140,18 +167,24 @@ jobs:
             pushd ${{ env.ZIP_DIR }}
             zip -r python.zip *
             popd
+            du -h ${{ env.ZIP_DIR }}/python.wasm ${{ env.ZIP_DIR }}/python.zip
         - name: "Create build artifact zip"
           run: |
             cp LICENSE cross-build/${{ env.TARGET_TRIPLE }}/
+            cp .build-config/DEPENDENCIES.md cross-build/${{ env.TARGET_TRIPLE }}/THIRD_PARTY_DEPENDENCIES.md
+            mkdir cross-build/${{ env.TARGET_TRIPLE }}/wasi-dependencies
+            cp .wasi-deps/lib/*.a cross-build/${{ env.TARGET_TRIPLE }}/wasi-dependencies/
             pushd cross-build/${{ env.TARGET_TRIPLE }}
             zip build.zip \
               LICENSE \
+              THIRD_PARTY_DEPENDENCIES.md \
               config.log config.cache Makefile pyconfig.h libpython*.a \
               Modules/Setup.local Modules/Setup.stdlib Modules/config.c \
               Modules/_decimal/libmpdec/libmpdec.a \
               Modules/_hacl/*.a \
               Modules/expat/libexpat.a \
-              Programs/python.o
+              Programs/python.o \
+              wasi-dependencies/*.a
             popd
         - name: "Upload executable zip"
           uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -180,7 +213,47 @@ jobs:
         - name: "Extract executable zip"
           run: unzip python.zip
         - name: "Test"
-          run: wasmtime --dir . python.wasm -m sysconfig
+          run: |
+            wasmtime --dir .::/ --env PYTHONHOME=/ python.wasm -m sysconfig
+            wasmtime --dir .::/ --env PYTHONHOME=/ python.wasm -c '
+            import bz2, gzip, io, lzma, zipfile, zlib
+            payload = b"WASI compression round trip" * 32
+            assert zlib.decompress(zlib.compress(payload)) == payload
+            assert bz2.decompress(bz2.compress(payload)) == payload
+            assert lzma.decompress(lzma.compress(payload)) == payload
+            archive = io.BytesIO()
+            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+                output.writestr("payload.txt", payload)
+            with zipfile.ZipFile(archive) as input_archive:
+                assert input_archive.read("payload.txt") == payload
+            assert gzip.decompress(gzip.compress(payload)) == payload
+            '
+            wasmtime --dir .::/ --env PYTHONHOME=/ python.wasm -c '
+            from datetime import datetime, timedelta
+            from zoneinfo import ZoneInfo
+            from packaging.version import Version
+            from dateutil.parser import isoparse
+            import six
+            assert ZoneInfo("Europe/Madrid").utcoffset(datetime(2026, 7, 1)) == timedelta(hours=2)
+            assert Version("2.0rc1") < Version("2.0")
+            assert isoparse("2026-08-09T12:34:56+02:00").utcoffset() == timedelta(hours=2)
+            assert six.text_type("ok") == "ok"
+            '
+            wasmtime --dir .::/ --env PYTHONHOME=/ python.wasm -c '
+            import sqlite3
+            database = sqlite3.connect("/sqlite-test.db")
+            database.execute("CREATE TABLE values_table(value INTEGER)")
+            database.execute("INSERT INTO values_table VALUES(42)")
+            database.commit()
+            database.close()
+            '
+            wasmtime --dir .::/ --env PYTHONHOME=/ python.wasm -c '
+            import sqlite3
+            database = sqlite3.connect("/sqlite-test.db")
+            assert database.execute("SELECT value FROM values_table").fetchone() == (42,)
+            database.close()
+            '
+            rm sqlite-test.db
 
     release:
       needs: [test, get-wasi-sdk-version]
